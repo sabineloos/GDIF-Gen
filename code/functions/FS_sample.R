@@ -98,6 +98,7 @@ FS_sample <- function(method = c("random",
   return(ind_field)
 }
 
+## MODIFIED FROM https://github.com/jeffreyevans/spatialEco/blob/master/R/subsample.distance.R
 subsample.distance <- function(datatosample, nsurvey, d, d.max = NULL, replacement = FALSE,
                                latlong = FALSE, echo = T) {
   if(latlong == TRUE) {  
