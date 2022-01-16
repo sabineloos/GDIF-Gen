@@ -1,0 +1,670 @@
+---
+title: "G-DIF Diagnostics"
+subtitle: 'Code to support the "Recommendations" to implement G-DIF'
+author: "[Sabine Loos](https://sabine-loos.com)"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: false
+    theme: sandstone
+    highlight: pygments
+    fig_align: center
+    fig_width: 5
+    fig_height: 5
+    df_print: paged
+    fig_caption: true
+    code_folding: show
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: false
+    theme: sandstone
+    highlight: pygments
+    fig_align: center
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, echo=F}
+knitr::opts_chunk$set(warning = F, message = F, dpi = 800, fig.align = 'center', fig.width=10, fig.height=6)
+```
+
+
+This notebook runs through the "Recommendations" section of the article "Efficacy of damage data integration: a comparative analysis of four major earthquakes." This article is available at: ⚠️ _link to be added_⚠️.  The full Github repository for this code is here: [https://github.com/sabineloos/GDIF-Gen](https://github.com/sabineloos/GDIF-Gen).
+
+We will be demonstrating this model building process using the New Zealand February 2011 earthquake data. This data is not publicly available, but was made available for this research by New Zealand's [Earthquake Commission](https://www.eqc.govt.nz/) and [Tonkin + Taylor](https://www.tonkintaylor.co.nz/). 
+
+This code goes through one realization of a field survey sample that is randomly sampled throughout the study area. It also builds on previous code to [develop G-DIF in Nepal](https://sabineloos.github.io/GDIF-damageprediction/GDIF_nb.html).
+
+# Setup G-DIF code and data
+Before we build G-DIF with this dataset, we need to do some initial setup to load the required packages, functions, and data for this example. Everything in this initial stage would be necessary to implement G-DIF in real-time, except for developing the field survey sample. The locations of the field surveys would already be identified by field survey teams before a modeler started to develop G-DIF. We also discuss field surveying strategies in the article, for any interested readers.
+
+The functions that are necessary to carry out this code are as follows. These are also included in the Github repository.
+
+- `logtr`: Several transformation functions, here we use the `std` function to standardize x variables.
+- `FS_sample`: This function develops a field survey sample using various techniques, including a `random` sample, `biased` sample, `clustered` sample, and `largedistance` sample.
+- `RK_trend`: This is a function to develop the trend function for G-DIF. Several inputs can be identified, including the type of trend model and whether to use stepwise selection.
+- `OK_parallel`: This is a wrapper function to implement Ordinary Kriging using the `gstat` package. It gives the option to run Ordinary Kriging in parallel, which is useful for especially large prediction areas. Here, we use it to krige the residuals of the trend function.
+- `RK_errormet`: This is a function to calculate several error metrics at certain locations. Here, we use it to calculate the errors of the final G-DIF damage estimate at _all points that were not used to train the models in G-DIF_.
+- `PlottingFunctions`: These include several plotting functions, typically using the `ggplot2` package
+
+We also read in the New Zealand data, which has already been prepped by connecting the field surveyed damage data with multiple secondary datasets. As you can see, this is of class `SpatialPointsDataFrame` and there were originally 78489 buildings in this dataset.
+
+```{r, class.source = 'fold-hide'}
+# clear data
+rm(list = ls())
+# load packages
+packages <- c("gstat", "foreach", "dplyr", "sp","raster", "car", "gridExtra")
+for (pkg in packages) {
+  if(!require(pkg, character.only = T)){install.packages(pkg, repos = 'http://cran.us.r-project.org')}; library(pkg, character.only = T)
+}
+
+# load functions
+functions <- c('OK_parallel','RK_trend','RK_errormet',"FS_sample", "logtr",
+               'PlottingFunctions')
+for (fn in functions) {
+  source(file = paste0("functions/", fn, ".R"))
+}
+rm(packages, functions, fn, pkg)
+
+# set date
+date <- format(Sys.Date(), "%m%d%y")
+
+# read in the spatial points data frame that contains all primary and secondary new zealand damage data
+## this is unfortunately not publicly available
+sp.nz <- readRDS("../data/forsim/nz.rds")
+sp.nz
+```
+## Define variables
+At this point, once a modeler has loaded their prepped dataset, they should identify their independent variables (e.g. the secondary data, or $X$) and their dependent variables (e.g. the primary data, or $Y$)
+
+The independent variables ($X$, `xvar`) in New Zealand are:
+
+- `MMI_USGS` = Shaking intensity, measured with Modified Mercalli Intensity (MMI) from USGS's ShakeMap. Any other ground motion estimate can be used here as well.
+- `DPM_med` = Damage Proxy Map (DPM), from NASA JPL-ARIA
+- `PAGER_pcollapse` = An engineering forecast of the probability of collapse using a vulnerability curve from USGS
+- `vs30` = An estimate of Vs30 from USGS.
+
+The ependent variable ($Y$, `yvar`) in New Zealand is:
+
+- `GT_BDR` = Building damage ratio per building
+
+though several other field surveyed metrics exist as well.
+
+```{r, class.source = 'fold-show'}
+# identify xvar and yvar.
+xvar <- c("MMI_USGS", "DPM_med","PAGER_pcollapse", "vs30")
+yvar <- "GT_BDR" 
+```
+
+## Field survey sample
+A modeler would not have a full damage dataset however, like the `sp.nz` dataset. Instead, they would have a prepared dataset _only_ at the field survey locations. In this code, we have to simulate this situation, so in the next few code chunks we develop a random field survey sample.
+
+First we define the index for the prediction area, which in this case is all the buildings in `sp.nz` that have all secondary variables, identified through `ind_studyarea`. `nstudyarea` is the number of buildings in `ind_studyarea`.
+
+```{r, class.source = 'fold-show'}
+# need to define the prediction area to draw sample from. 
+ind_studyarea <- which(!is.na(sp.nz$gwdMedian) & !is.na(sp.nz$DPM_med) & !is.na(sp.nz$vs30))
+nstudyarea = length(ind_studyarea)
+nstudyarea
+```
+
+The prediction area is all x and y variables, at `ind_studyarea`:
+```{r, class.source = 'fold-show'}
+# Define sp.pred
+## sp.pred is the spatial dataframe with all predictors and final variables ONLY at study area index
+sp.pred <- sp.nz[ind_studyarea,c("OBJECTID", "fsAREA","GT_nbldgs", yvar, xvar)]
+
+# add GT_OUT to sp.pred, for modeling purposes. This is the same as GT_BDR
+sp.pred$GT_OUT <- sp.pred@data[,yvar]
+head(sp.pred)
+```
+
+We then develop the field survey index using the following parameters:
+
+- `pctsurvey` = fraction of `nstudyarea` that is sampled, in this case we want to sample 100 buildings, or 0.17% of the data. 
+- `fstype` = the field sampling strategy, in this case `random`
+- `nsurvey` = the final number of surveys, given `pctsurvey`, in this case `nsurvey` = 100.
+
+```{r, class.source = 'fold-show'}
+# parameter definition for the field sruveys
+pctsurvey = 0.001711567 # 100 bldgs (100/58426)
+fstype <- "random"
+nsurvey = round(pctsurvey*nstudyarea)
+nsurvey
+```
+We will use these above parameters as an input into the `FS_sample` function. This wouldn't happen in real time, as the field sample would already be defined by the surveyors. `FS_sample` outputs a set of indices to draw from the study area. 
+
+```{r, class.source = 'fold-show'}
+# set seed 
+seed = 12; set.seed(seed)
+
+# get indices for field sample
+ind_field <- FS_sample(method = fstype, # random 
+                       datatosample = sp.pred@data, 
+                       nsurvey = nsurvey,
+                       nbldgs = floor(nsurvey*mean(sp.pred$GT_nbldgs, na.rm = T)), 
+                       seed = seed,
+                       location = "nz")
+
+head(ind_field)
+```
+
+The field survey sample is therefore `sp.pred` at `ind_field`:
+```{r, class.source = 'fold-show'}
+sp.field <- sp.pred[ind_field,]
+head(sp.field)
+```
+
+# G-DIF Diagnostics 
+Here, we'll run through several model building steps and diagnostics for building the models in G-DIF. This is organized in the same order as the steps listed in the "Recommendations" section of the paper. At the beginning of each step, we directly quote the recommendation from the paper.
+
+## 1. Evaluate field survey sample size
+> **_RECOMMENDATION FROM PAPER :_** The size of the field survey sample will dictate how a modeler trains and evaluates the accuracy of G-DIF's damage estimate.
+Methods such as k-fold cross-validation, leave-one-out cross-validation, and bootstrapping can be used for training and validating the models within G-DIF.
+In addition, with more field data, a modeler can create a separate test set to evaluate G-DIF's potential prediction performance on unsurveyed locations.
+Generally, more field data will lead to a more accurate damage estimate with less variation.
+
+Now imagining that we didn't just define the field survey sample size... and we got it from the field. We should first see how big the sample is:
+
+```{r, class.source = 'fold-show'}
+length(sp.field$GT_BDR)
+```
+This size should be a big enough sample to create to sufficiently build the trend and spatial correlation models (pending some other checks in the next few steps). Importantly, it is big enough to build these models with a training/validation set, or k-fold cross-validation. Importantly, a test set should be held out, when there enough field samples, to evaluate the performance of the models within G-DIF. Here, since we know the damage at all other `r nstudyarea - length(sp.field$GT_BDR)` buildings in the study area, we will just use these for final evaluation of G-DIF, though in reality, we would split the `r length(sp.field$GT_BDR)` buildings into training and test sets.
+
+We can evaluate some basic summary statistics about the field sample of building damage, including the quartiles, mean, and standard deviation.
+```{r, class.source = 'fold-show'}
+summary(sp.field$GT_BDR)
+sd(sp.field$GT_BDR)
+```
+
+We might even want to see the full distribution of values. A simple histogram will do.
+```{r out.width="70%", fig.cap="Field surveyed damage", echo = FALSE}
+ggplot(sp.field@data)+
+    geom_histogram(aes_string(x="GT_BDR", 
+                              y = "..count../sum(..count..)"), fill = "black", alpha = 0.5, 
+                   color = "transparent", bins = 25)+
+  scale_x_continuous(expand = c(0,0), limits = c(0,1))+ scale_y_continuous(expand = c(0,0))+
+  labs(title = "Distribution of field surveyed damage", x = "Building damage ratio",
+       y = "Fraction of field surveyed buildings") + plotTheme(base_size = 14)
+```
+You'll notice that the distribution of field surveyed damage in New Zealand is Right-Skewed and has a spike at 0.75. The right-skew is not always the case, sometimes, the distribution can be left-skewed, as was seen in [Nepal](https://sabineloos.github.io/GDIF-damageprediction/GDIF_nb.html#22_exploring_the_data). The spike at 0.75 was due to how the building damage ratio was assessed in New Zealand, again this will not always be the case. Here, surveyors marked all collapsed buildings as 0.75, which was the reason for this spike. 
+
+## 2. Establish boundary of prediction area 
+
+>**_RECOMMENDATION FROM PAPER :_** In real time, the modeler would establish the spatial boundary for the forward prediction of damage using G-DIF. Here, we draw the boundaries based on the regions where all of the secondary datasets are available. In Haiti, New Zealand, and Nepal, this meant constraining the prediction area to the footprint of the remote sensing-derived data. However, it is likely that a damage estimate would be needed outside of this footprint. An initial boundary could be the area of strong shaking in the USGS ShakeMap, and users on the ground can help refine this by considering areas they will focus on during response and recovery. To accommodate datasets that are not available throughout the entire prediction area, separate trend models can be built for multiple subregions. Alternatively, one can integrate these datasets using Bayesian methods. However, developing explicit methods to do this in a spatial manner requires future research.
+
+In this case, we have already defined the prediction area as the area where we have all secondary datasets. Like what is stated in the recommendation, this is a big point for the modeler. They should establish this boundary based on both available data and through discussion with stakeholders on where they would like to know damage.
+
+Here we can plot `sp.pred`, the study area, with the ward boundaries of Christchurch, NZ.
+```{r fig.width = 5, fig.height=4, echo = FALSE}
+# load NZ admin data from GADM
+sp.admin <- rgdal::readOGR(dsn = "../data/kx-christchurch-ward-map-SHP", verbose = F)
+source(file ="functions/sp2gg.R")
+gg.admin <- sp2gg(sp.admin[-1,]) # removing banks peninsula
+df.nzAdminLabels <- as.data.frame(sp.admin[-1,])
+df.nzAdminLabels$label <- df.nzAdminLabels$name
+df.nzAdminLabels$x <- coordinates(sp.admin)[-1,1]; df.nzAdminLabels$y <- coordinates(sp.admin)[-1,2]
+
+# map prediction area with NZ wards 
+plot_points(sp.points = sp.pred, col_pal = "darkgray",draw_admin = T,
+            admin_gg = gg.admin, admin_lab_df = df.nzAdminLabels, 
+            admin_col = "black", field_col = "GT_BDR") + 
+  theme(legend.position = "none") + coord_equal() + labs(title = "New Zealand prediction area", subtitle = "Prediction area shown in gray")
+```
+
+We can see that the current prediction area covers most of the central wards of Christchurch. However, a modeler could define a different prediction area depending on the needs of stakeholders. Here, we keep this prediction area (even though it misses some wards), because we can use these gray buildings for validation later.
+
+## 3. Assess spatial distribution of field sample
+>**_RECOMMENDATION FROM PAPER :_** Combining the previous two steps, modelers should evaluate whether the field sample is spatially distributed across the prediction area.
+Highly clustered field samples will converge to the trend model in regions outside of the field surveyed area. 
+Field surveys collected at distances greater than the expected spatial correlation may result in a ``nugget'' variogram, or a variogram with constant semivariance at all distances. 
+In both cases, modelers should focus on building a predictive trend model that accurately reflects the relationships between the field survey samples and secondary data (discussed in step 5).
+
+The first thing we should do is map our field survey sample, `sp.field`,  with relation to the study area, `sp.pred`. As you can see below, the black dots are the locations of the buildings in the field survey sample, and the gray dots are the locations of all the buildings in our study area (where we want to predict the results of G-DIF). 
+```{r out.width="75%", fig.cap="Field survey map (black) compared to full study area (gray)", echo = TRUE}
+ggplot(data = as.data.frame(sp.pred)) + 
+  geom_point(aes_string("Long","Lat"), color = "darkgray", 
+             alpha = 0.5, size = 0.2, shape = 16) + 
+  geom_point(data = as.data.frame(sp.field), 
+             aes_string("Long","Lat"), color = "black",
+             size = 1, shape = 16)+
+  plotThemeMap()+coord_equal()
+  
+```
+
+We notice that the 100 points in our field survey are sufficiently scattered throughout the prediction area, and are not clustered, so hopefully it captures a good distribution of the secondary data (but we'll be checking that in the next step). 
+
+However, are the points are at a close enough distance to build a variogram for the spatial correlation model? We can evaluate this by looking at the **distance matrix** of the separation distances between the field surveyed points. Here we can see the distances between the first five points in the field survey sample:
+
+```{r, class.source = 'fold-show'}
+distmat <- as.matrix(spDists(sp.field)); diag(distmat) <- NA;
+distmat[1:5,1:5]
+```
+
+It might be easier to just see the distribution of separation distances in our distance matrix though:
+```{r, out.width="75%", fig.cap="Distances between field surveyed buildings"}
+plot_histogram(dataframe = as.data.frame(as.vector(distmat)), "as.vector(distmat)")+
+  labs(title = "Distances between field surveyed buildings", 
+       x = "Separation distances (km)")
+```
+
+We can see that the majority of separation distances are between 0-10km. This is often within the range of spatial correlation of trend residuals, so we have enough points at close enough distances to build our variogram later.
+
+## 4. Compare field survey sample values to other locations
+>**_RECOMMENDATION FROM PAPER :_** The modeler should compare values of secondary data at the field surveyed locations to the full distribution of secondary data at all locations. As much as possible, the variance of the secondary data at the field surveyed locations should reflect the variance over the entire affected region. Otherwise, the trend estimate may not extrapolate well outside of sample distribution's range. This might occur if field surveys are clustered so that there is little variation in the secondary data. This could also be due to datasets available at too low of a resolution, though this is unlikely with the datasets represented in this study. If this occurs, additional field surveys should be collected, if possible, for a wider range of secondary data values.
+
+
+Remember how we said that the field survey should capture much of the secondary data? We should also analytically check this. We could potentially just compare the summary statistics of the secondary data at the field survey locations...
+```{r, class.source = 'fold-show'}
+summary(sp.field@data[,xvar])
+```
+to those same summary statistics over the entire prediction area:
+```{r, class.source = 'fold-show'}
+summary(sp.pred@data[,xvar])
+```
+
+But, again it might be easier to visualize these distributions. Here, we plot the histograms of all the secondary data (or the `xvar`) at the field survey locations compared to the study area.
+
+```{r, out.width='.99\\linewidth', fig.align='center', echo=FALSE, fig.width=10, fig.height=7, fig.cap="Comparison between field survey locations and full study aea of the distributions of all secondary data"}
+pl <- list()
+
+pl[[1]] <- ggplot(sp.pred@data, aes_string(x="MMI_USGS",y = "..count../sum(..count..)"))+
+  geom_histogram(aes(fill = "Study Area"),color = "transparent") +
+  geom_histogram(aes(fill = "Field Sample"), data = sp.field@data, alpha = 0.5, color = "transparent")+
+  labs(title = "Shaking Intensity", y = "Fraction of points", x = "MMI")+
+  scale_fill_manual("Location",values = c("Study Area" = "snow3", "Field Sample" = "black"))+
+    scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+    plotTheme(base_size = 14) + theme(legend.position = "right", legend.direction = "vertical")
+
+pl[[2]] <- ggplot(sp.pred@data, aes_string(x="DPM_med",y = "..count../sum(..count..)"))+
+  geom_histogram(aes(fill = "Study Area"),color = "transparent") +
+  geom_histogram(aes(fill = "Field Sample"), data = sp.field@data, alpha = 0.5, color = "transparent")+
+  labs(title = "Damage Proxy Map", y = "Fraction of points", x = "DPM integer")+
+  scale_fill_manual("Location",values = c("Study Area" = "snow3", "Field Sample" = "black"))+
+    scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+    plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+pl[[3]]<- ggplot(sp.pred@data, aes_string(x="PAGER_pcollapse",y = "..count../sum(..count..)"))+
+  geom_histogram(aes(fill = "Study Area"),color = "transparent") +
+  geom_histogram(aes(fill = "Field Sample"), data = sp.field@data, alpha = 0.5, color = "transparent")+
+  labs(title = "Engineering forecast", y = "Fraction of points", x = "Collapse probability")+
+  scale_fill_manual("Location",values = c("Study Area" = "snow3", "Field Sample" = "black"))+
+    scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+    plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+pl[[4]] <- ggplot(sp.pred@data, aes_string(x="vs30",y = "..count../sum(..count..)"))+
+  geom_histogram(aes(fill = "Study Area"),color = "transparent") +
+  geom_histogram(aes(fill = "Field Sample"), data = sp.field@data, alpha = 0.5, color = "transparent")+
+  labs(title = "Vs30", y = "Fraction of points", x = "Vs30")+
+  scale_fill_manual("Location",values = c("Study Area" = "snow3", "Field Sample" = "black"))+
+    scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+    plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+# plot all maps together
+grid.arrange(grobs = lapply(pl, "+", theme(plot.margin = unit(c(10,10,10,10), "points"))), ncol = 2, nrow = 2)
+```
+
+Now we can see that the field sample indeed covers the same ranges as the full study area of the secondary data. Therefore, we have more confidence in using these samples and secondary data to build G-DIF.
+
+One note here, is that we are planning to try out Ordinary Least Squares (OLS) for our trend model. We'd like to be able to compare our coefficients from the OLS model, so we also standardize these variables to have mean 0 and sd of 1.
+```{r}
+## standardize variables
+sp.pred@data[,xvar] <- apply(sp.pred@data[,xvar], 2, std)
+
+## redefine field
+sp.field <- sp.pred[ind_field,]
+summary(sp.field@data[,c(xvar)])
+```
+
+## 5. Explore relationships between primary and secondary data
+>**_RECOMMENDATION FROM PAPER :_**When building the trend model, the modeler should incorporate the relationships that exist between each secondary dataset and the field survey sample.
+Many relationships between the secondary data and the field data are close to linear.
+One can evaluate this by examining the moving average of the field damage at various bins of each secondary data, or creating a ``loess" curve.
+Nonlinear trends can be considered by transforming the secondary dataset using a nonlinear trend model.
+
+When figuring out how to define the trend model, we should look at the relationships between each secondary dataset and the field surveyed damage using our field dataset. One simple way to do this is to look at scatterplots between the two and see what relationship exists. Here, we plot the scatterplots between the `yvar`, GT_BDR on the y-axis and each `xvar` on the x-axis. Then we look at their relationships through both a moving average or "loess" curve and a linear model.
+
+```{r, out.width='.99\\linewidth', fig.align='center', echo=FALSE, fig.width=10, fig.height=7, fig.cap="Assessing relationships between field damage and each secondary data source"}
+pl <- list()
+
+pl[[1]] <- ggplot(sp.field@data, aes(x = MMI_USGS, y = GT_BDR))+
+  geom_point(alpha= 0.5, size = 2) + 
+  geom_smooth(aes(color = "linear", fill = "linear"),method = "lm", alpha = 0.1)+ 
+  geom_smooth(aes(color = "loess", fill = "loess"),method = "loess", alpha = 0.1, n = 25)+
+  scale_color_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  scale_fill_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  labs(title = "Shaking intensity", y = "Building damage ratio (Y)", x = "MMI (X)")+
+  scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+  plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+pl[[2]] <- ggplot(sp.field@data, aes(x = DPM_med, y = GT_BDR))+
+  geom_point(alpha= 0.5, size = 2) + 
+  geom_smooth(aes(color = "linear", fill = "linear"),method = "lm", alpha = 0.1)+ 
+  geom_smooth(aes(color = "loess", fill = "loess"),method = "loess", alpha = 0.1, n = 25)+
+  scale_color_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  scale_fill_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  labs(title = "Damage Proxy Map", y = "Building damage ratio (Y)", x = "DPM integer (X)")+
+  scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+  plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+pl[[3]] <- ggplot(sp.field@data, aes(x = PAGER_pcollapse, y = GT_BDR))+
+  geom_point(alpha= 0.5, size = 2) + 
+  geom_smooth(aes(color = "linear", fill = "linear"),method = "lm", alpha = 0.1)+ 
+  geom_smooth(aes(color = "loess", fill = "loess"),method = "loess", alpha = 0.1, n = 25)+
+  scale_color_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  scale_fill_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  labs(title = "Engineering Forecast", y = "Building damage ratio (Y)", x = "Collapse probability (X)")+
+  scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+  plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+pl[[4]] <- ggplot(sp.field@data, aes(x = vs30, y = GT_BDR))+
+  geom_point(alpha= 0.5, size = 2) + 
+  geom_smooth(aes(color = "linear", fill = "linear"),method = "lm", alpha = 0.1)+ 
+  geom_smooth(aes(color = "loess", fill = "loess"),method = "loess", alpha = 0.1, n = 25)+
+  scale_color_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  scale_fill_manual("Method", values = c("linear" = PalBRG.discrete[1], "loess" = PalBRG.discrete[3]))+
+  labs(title = "Vs30", y = "Building damage ratio (Y)", x = "Vs30 (X)")+
+  scale_x_continuous(expand = c(0,0))+ scale_y_continuous(expand = c(0,0))+
+  plotTheme(base_size = 14)+ theme(legend.position = "right", legend.direction = "vertical")
+
+## map together
+grid.arrange(grobs = lapply(pl, "+", theme(plot.margin = unit(c(10,10,10,10), "points"))), ncol = 2, nrow = 2)
+```
+
+As we can see here, many of these variables exhibit positive relationships with the groundtruth, as expected. This is good, otherwise we might consider manually removing that variable. We can also see that in many of these cases, a linear relationship might be sufficient for each predictor (though one could explore defining other nonlinear relationships as well depending ont he results of these exploratory plots).
+
+## 6. Address redundant data
+>**_RECOMMENDATION FROM PAPER :_** Some damage datasets may be collinear (e.g., an engineering forecast may be closely aligned with a ShakeMap). Collinearity can lead to unreliable estimates of the coefficients for each secondary dataset and to overfitting. Ways to address collinearity are by evaluating the variance inflation factor before modeling, applying variable selection techniques, or aggregating collinear variables using principal component analysis.
+
+We should also get a handle on our predictor variables themselves, and evaluate whether any of them might exhibit collinearity. This will pose issues when fitting the trend model.
+
+First, we can just do some visual comparisons of each predictor by mapping them out. Remember these are the transformed variable (they were standardized earlier)/
+
+```{r, out.width='.99\\linewidth', fig.align='center', echo=FALSE, fig.width=10, fig.height=5, fig.cap="Visual comparisons of all secondary data"}
+pl <- list()
+
+pl[[1]] <- plot_points(sp.points = sp.pred, field_col = "MMI_USGS", 
+            alpha = 1, legend_title = "MMI",
+            ptsize = 0.2, shape = 16)+plotThemeMap(legend.position = "bottom")+
+  labs(title = "Shaking Intensity")
+
+pl[[2]] <- plot_points(sp.points = sp.pred, field_col = "DPM_med", 
+            alpha = 1, legend_title = "DPM integer",
+            ptsize = 0.2, shape = 16)+plotThemeMap(legend.position = "bottom")+
+  labs(title = "DPM")
+
+pl[[3]] <- plot_points(sp.points = sp.pred, field_col = "PAGER_pcollapse", 
+            alpha = 1, legend_title = "P(Collapse)",
+            ptsize = 0.2, shape = 16)+plotThemeMap(legend.position = "bottom")+
+  labs(title = "Eng. Forecast")
+
+pl[[4]] <- plot_points(sp.points = sp.pred, field_col = "vs30", 
+            alpha = 1, legend_title = "vs30",
+            ptsize = 0.2, shape = 16)+plotThemeMap(legend.position = "bottom")+
+  labs(title = "Vs30")
+
+## map together
+# plot all maps together
+grid.arrange(grobs = lapply(pl, "+", theme(plot.margin = unit(c(10,10,10,10), "points"))), ncol = 4, nrow = 1)
+```
+We can see just from these maps that the Shaking Intensity and the Engineering Forecast might be highly correlated just from their similarities in their spatial patterns. This is because the Engineering forecast is essentially a function of the Shaking Intensity.
+
+A more quantitative way to evaluate this is through the Variance Inflation Factor (VIF). The VIF is a metric that captures the multicollinearity between variables through the following equation:
+
+$VIF = \frac{1}{1-R_i^2}$ where $i$ is the variable of interest. VIF's greater than 5 are problematic and VIF's greater than 10 should be addressed.
+
+To evaluate the VIF for our secondary datasets in R, we first have to create a linear model that uses all of our `xvar`.
+
+```{r, class.source = 'fold-show'}
+# create a model that uses all independent variables
+form <- as.formula(paste(yvar, paste(xvar, sep = "", collapse = " + "), sep = " ~ "))
+form
+mod.VIF <- lm(form, sp.field@data)
+summary(mod.VIF)
+```
+
+Then we can evaluate the variance inflation factor (VIF) using the `car` package.
+```{r, class.source = 'fold-show'}
+car::vif(mod.VIF)
+```
+
+The VIF's here confirm our suspicion. The VIF for the Shaking intensity and the Engineering Forecast are both over 10, meaning these two variables exhibit high collinearity with another variable which should be addressed in our trend model.
+
+Another way to evaluate collinearity between secondary data is through the correlation matrix.
+```{r, class.source = 'fold-show'}
+cor(sp.field@data[,xvar])
+```
+
+Again, we see that the engineering forecast and the shaking intensity have a high correlation (`r cor(sp.field@data[,xvar])[3,1]`), confirming the need to address this in the trend model.
+
+### Methods to address collinearity
+This collinearity between the shaking intensity and the engineering forecast can pose problems with obtaining accurate coefficient estimates. There are multiple ways to address this, as described in the earlier recommendation. Here, we will implement mixed stepwise selection when training the trend model. We could also manually remove one of the variables, depending on our level of trust in the data.
+
+## 7. Build and refine the trend model
+>**_RECOMMENDATION FROM PAPER :_** After building the trend model, the modeler should check the coefficients for each secondary dataset. A coefficient opposite from expectations (for example, predictions of decreasing damage with increasing ground shaking intensity), may indicate that the secondary dataset is unreliable or that outliers exist and should be removed from the model. Otherwise the directions of the coefficients should reflect the relationships seen in Step 5. To evaluate the relative utility of each secondary dataset, one should ensure that each variable is standardized to ensure that coefficients are comparable. The coefficients and standard errors of each variable in the trend model will provide intuition behind which secondary dataset has the most influence on the trend estimate.
+
+Now that we've thoroughly explored our data, we can start building the models in G-DIF. First, we need to build the trend model that connects the x and y variables.Here we use `RK_trend` to build the trend model. At this stage, we have an opportunity to choose the best trend model through cross-validation, which we did in the previous investigation. To see more of that, please visit [here](https://sabineloos.github.io/GDIF-damageprediction/GDIF_nb.html#23_trend_model). One could compare an Ordinary Least Squares, to a Generalized Least Squares, to potentially even other regression models. However, for the purpose of this example we stick to the OLS.
+
+```{r, class.source = 'fold-show'}
+list.trend <- RK_trend(locn_shp = sp.field, 
+                       newdata_shp = sp.pred,
+                       model = "OLS", ## indicate trend model to use
+                       stepwise = T, ## here we indicate that we DO want to use stepwise selection
+                       dependent.var_char = "GT_OUT",
+                       independent.var_vec = xvar,
+                       id.var_char = "OBJECTID",
+                       return_se = T)
+sp.field <- list.trend$locn_shp
+sp.pred <- list.trend$newdata_shp
+```
+
+Now that we've built our trend model, we want to make sure that its results make sense. Let's take a look at the coefficients found in the model and their standard errors. We want to make sure these make sense and match the directions we'd expect and that we found in our exploratory scatterplots.
+
+```{r, out.width="75%", fig.width=5, fig.height=5}
+p.coeff <- plot_coeff(var_vec = names(list.trend$coeff)[2:ncol(list.trend$coeff)],
+                      coeff_vec = list.trend$coeff[2:ncol(list.trend$coeff)],
+                      se_vec = list.trend$se[2:3],
+           plot_true = F,
+           var_color = coolpal(5)[3])
+p.coeff
+```
+
+All coefficients look OK, they exhibit positive relationships, which is both what we expected and what we saw in our exploratory analysis. You'll also noticed that two variables were removed through the stepwise selection: the engineering forecast `PAGER_pcollapse` and `vs30`. This addresses the multicollinearity found between `MMI_USGS` and `PAGER_pcollapse` and the previous step, and also the fact that `vs30` was a non-predictive dataset (we can see this through the scatterplots in Step 5).
+
+And just to make sure, let's take a look at the map of the trend prediction.
+```{r}
+plot_points(sp.points = sp.pred, field_col = "trnd", 
+            alpha = 1, legend_title = "Building damage ratio",
+            ptsize = 0.2, shape = 16, scale_legend = T, 
+            legend_lims = seq(0,1,0.2))+  
+  plotThemeMap(legend.position = "bottom")+
+  labs(title = "Trend prediction")
+```
+
+Since the next step in G-DIF is to use the residuals of the trend model to develop the spatial correlation model, we should take a look at these residuals. Let's first see a histogram of these residuals.
+
+```{r, class.source = 'fold-show', fig.cap="Histogram of the trend residuals, vertical line is the mean"}
+resids = sp.field$trnd_resid
+
+# histogram of residuals
+plot_errorhistogram(resids) + labs(title = "Trend residuals", x = "Residuals", y = "Fraction of field surveyed points")
+```
+
+These residuals look pretty good! The mean of the residuals is at 0, which is what we'd hope. An assumption for kriging is that the data we are kriging is Gaussian. Our histogram looks like our residuals _might_ be normal, but we can develop another plot to compare our distribution above to the theoretical distribution of the Normal distribution. We do this by developing the QQ-plot, which compares our empirical cumlative distribution to that of a normal distribution with the same mean and standard deviation. 
+
+```{r, class.source = 'fold-show', fig.cap="QQ-plot of the trend residuals", fig.width=5, fig.height=5}
+# sample moments of the residuals distribution
+mu = mean(resids); sig = sd(resids)
+
+# qq plot
+x = sort(resids);
+x_qtls = ((1:length(resids)) - 0.5)/length(resids) # calculate quantiles
+y_cdf = qnorm(x_qtls, mean = mu, sd = sig)
+ggplot(data = data.frame(x = x, y = y_cdf))+ geom_point(aes(x, y))+
+  geom_abline(aes(slope = 1, intercept = 0))+
+  labs(x = "Observed residuals at field locations", 
+       y = "Theoretical Normal distribution", title = "QQ-plot of the trend residuals")+
+  scale_x_continuous(limits = c(-1,1), expand = c(0,0))+
+  scale_y_continuous(limits = c(-1,1), expand = c(0,0))
+```
+This seems good! As you can see, our data (the black dots) lies along the 1-1 line, which is what we'd hope for if our data would match the theoretical Normal distribution.
+
+In the case of non-Gaussian residuals, we can transform the residuals and continue to model in the Gaussian space. However, because our residuals resemble a normal distribution, this is not necessary. One method to transform your residuals is through the normal score transformation. We provide code for this in the `functions` folder called `nscore.R`.
+
+## 8. Build and refine the spatial correlation model
+>**_RECOMMENDATION FROM PAPER :_**  The choice of variogram and kriging method affects the final spatial pattern of damage, especially in situations where the secondary data are poor predictors of the true damage.
+In addition to selecting the variogram based on best fit, modelers should also consider the expected spatial pattern that result from the selected variogram.
+If the fitted variogram exhibits a trend (or the semivariance increases with distance), the field surveyed damage may not have been successfully detrended with the trend estimate or perhaps the selected variogram model is too flexible.
+In this case, it might be preferable to consider local kriging, where only the closest surveyed points to the unsurveyed location are considered when making the kriging prediction.
+If a nugget variogram is fit to the detrended survey points, the trend model may have fully captured the spatial correlation in damage.
+The modeler should compare the variogram fit to the detrended field surveys with the variogram fit to the original field surveys, to ensure the nugget variogram is not arising from a lack of closely spaced field data (as discussed in Step 3).
+
+Now that we've checked the assumptions for kriging in the previous step, we can start to develop our spatial correlation model. First we can develop a variogram of the residuals. Here, we compare three different variogram models, the Exponential, the Spherical, and the Matern, using cross-validation. We see that the Matern model fits best.
+```{r, class.source = 'fold-show'}
+# Fit variogram to residuals using autofit
+vgm.resid <-automap::autofitVariogram(formula = trnd_resid~1,
+                                      input_data = sp.field,
+                                      model = c("Exp", "Sph", "Mat"), 
+                                      verbose = F)
+vgm.resid$var_model
+```
+
+We should however, visually evaluate the variogram when compared to the empirical variogram. We can also compare the original variogram (of the field surveyed damage) to the residual variogram, to see if we successfully detrended the data.
+```{r}
+# Fit variogram to field data (GT_OUT) for comparison
+vgm.field <-automap::autofitVariogram(formula = GT_OUT~1,
+                                      input_data = sp.field,
+                                      model = c("Exp", "Sph", "Mat"), 
+                                      verbose = F)
+```
+
+```{r, out.width='.99\\linewidth',fig.align='center'}
+pl <- list()
+pl[[1]] <- plot_vario_simple(vgm.field) + labs(title = "Original variogram (of field surveyed damage)")
+pl[[2]] <- plot_vario_simple(vgm.resid) + labs(title = "Detrended variogram (of trend residuals)")
+
+# plot all maps together
+grid.arrange(grobs = lapply(pl, "+", theme(plot.margin = unit(c(10,10,10,10), "points"))), ncol = 2, nrow = 1)
+```
+We can see how by detrending our data, our variogram has become much more defined and the range has reduced. 
+
+Now we can krige our residuals using the `OK_parallel` function and `vgm.resid`. Here we perform local kriging, partly because the New Zealand dataset is pretty large. One could use cross-validation to decide and `nmin` and `nmax`. Here, we manually define these parameters.
+```{r, class.source = 'fold-show'}
+nmin = 2; nmax = 10;
+sp.krige <- OK_parallel(vgm.model = vgm.resid, # variogram of the residuals
+                        locn_shp = sp.field, # shp data to develop variogram
+                        newdata_shp = sp.pred, # shp data to predict kriging residuals at
+                        nmin = nmin, nmax = nmax, # local kriging 
+                        dependent.var = "trnd_resid",
+                        debuglev = 1, parallel = F)
+```
+
+And again, let's just check the results of the kriging before saving the results in `sp.pred`
+```{r}
+pl <- list()
+pl[[1]] <- plot_points(sp.points = sp.krige, field_col = "var1.pred", 
+            alpha = 1, col_pal = errorpal,
+            ptsize = 0.2, shape = 16)+  
+  plotThemeMap(legend.position = "bottom")+labs(title = "Kriged residuals")
+
+pl[[2]] <- plot_points(sp.points = sp.krige, field_col = "var1.var", 
+            alpha = 1, col_pal = warmpal(100),
+            ptsize = 0.2, shape = 16)+  
+  plotThemeMap(legend.position = "bottom")+labs(title = "Kriging variance")
+
+# plot all maps together
+grid.arrange(grobs = lapply(pl, "+", theme(plot.margin = unit(c(10,10,10,10), "points"))), ncol = 2, nrow = 1)
+
+```
+
+```{r}
+# add to sp.pred
+sp.pred$resid_pred_OK <- sp.krige$var1.pred
+sp.pred$resid_var_OK <- sp.krige$var1.var
+```
+
+## 9. Calculate performance metrics
+>**_RECOMMENDATION FROM PAPER :_** Finally, the modeler should calculate the model performance on a test set of field surveys held out from all model fitting.
+The modeler can use the fitted model to predict damage at the test set locations and calculate the mean error, variance in the error, and mean squared error.
+Prediction errors for newly acquired field data should be monitored---low errors would confirm the current G-DIF damage estimate, whereas high errors would trigger a model update.
+
+We can develop our final damage prediction by adding the trend model and the spatial correlation model results. In this example, we bound our predictions to be between 0 and 0.75, but another way to address this would be to use Normal Score Transformation on  our dependendent variable, `GT_BDR`, and transform back after modeling. 
+```{r, class.source = 'fold-show'}
+# predict
+sp.pred$RK_pred_fin<- rowSums(sp.pred@data[,c("trnd", "resid_pred_OK")], na.rm=TRUE)
+
+# bounding predictions
+targ_min <- min(sp.pred$GT_OUT, na.rm = T)
+targ_max <- max(sp.pred$GT_OUT, na.rm = T)
+sp.pred$RK_pred_fin[sp.pred$RK_pred_fin <=targ_min] <- targ_min
+sp.pred$RK_pred_fin[sp.pred$RK_pred_fin >=targ_max] <- targ_max
+
+# final variance
+sp.pred$RK_var_fin <- rowSums(sp.pred@data[,c("trnd_var", "resid_var_OK")], na.rm=TRUE)
+```
+
+We should compare our G-DIF estimate to the true damage. In this example, we know what the true damage was so we can visually compare our predictions. However, in a real-time scenario, one could only compare the results at our test set locations.
+```{r, out.width='.09\\linewidth',fig.show='hold',fig.align='center', fig.cap="Visual comparison of G-DIF damage estimate to true damage"}
+pl <- list()
+
+pl[[1]] <- plot_points(sp.points = sp.pred, field_col = "RK_pred_fin", 
+            alpha = 1, legend_title = "Building damage ratio",
+            ptsize = 0.2, shape = 16, scale_legend = T, 
+            legend_lims = seq(0,1,0.2))+  
+  plotThemeMap(legend.position = "bottom")+
+  labs(title = "G-DIF prediction")
+
+pl[[2]] <- plot_points(sp.points = sp.pred, field_col = "GT_BDR", 
+            alpha = 1, legend_title = "Building damage ratio",
+            ptsize = 0.2, shape = 16, scale_legend = T, 
+            legend_lims = seq(0,1,0.2))+  
+  plotThemeMap(legend.position = "bottom")+
+  labs(title = "True damage")
+
+# plot all maps together
+grid.arrange(grobs = lapply(pl, "+", theme(plot.margin = unit(c(10,10,10,10), "points"))), ncol = 2, nrow = 1)
+
+```
+
+Again, we can quantitatively assess the error in our prediction by looking at the error at _all the points in the study area that were NOT used for fitting the models_. A histogram of these errors are:
+
+```{r, class.source = 'fold-show', out.width='75%', fig.width=5, fig.height=5}
+ERROR <- rowSums(cbind(sp.pred@data[-ind_field,"RK_pred_fin"], ## don't validate at fitting sites
+                       - sp.pred@data[-ind_field, "GT_OUT"]), na.rm = F)## don't validate at fitting sites
+
+plot_errorhistogram(ERROR)+xlim(c(-1,1))
+```
+
+But what would be better is to evaluate a few key error metrics. We can do this by using the `RK_errormet` function.
+```{r, class.source = 'fold-show'}
+errormets <- RK_errormet(newdata = sp.pred@data,
+            dependent.var_char = "GT_OUT",
+            pred.var_char = "trnd",
+            var.var_char = "trnd_var",
+            n_pred = length(list.trend$coeff)-1,
+            ind_validation = -ind_field, ## don't validate at fitting sites
+            SDSR = F, accplot = F)
+```
+
+We find that the Mean Squared Error, or MSE, is 
+```{r}
+errormets$MSE
+```
+
+The variance of the error, or VE, is
+```{r}
+errormets$VE
+```
+
+And the mean of the error, or ME, is 
+```{r}
+errormets$ME
+```
+
+And there you have it! If you have any questions, please email Sabine Loos at [sloos@alumni.stanford.edu](emailto:sloos@alumni.stanford.edu).
+
