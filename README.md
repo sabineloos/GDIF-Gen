@@ -4,7 +4,7 @@ This repository contains code to support the following paper:
 
 *<u>insert paper citation*</u>
 
-To cite this data or software, please use the following DOI: 
+To cite this data or software, please use the following DOI: [![DOI](https://zenodo.org/badge/448048262.svg)](https://zenodo.org/badge/latestdoi/448048262)
 
 ## Using the code
 
