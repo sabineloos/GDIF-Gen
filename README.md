@@ -2,7 +2,7 @@
 
 This repository contains code to support the following paper:
 
-*<u>insert paper citation*</u>
+Loos, S., Levitt, J., Tomozawa, K., Baker, J., & Lallemant, D. (2022). Efficacy of Damage Data Integration: A Comparative Analysis of Four Major Earthquakes. Natural Hazards Review, 23(4), 04022026. https://doi.org/10.1061/(ASCE)NH.1527-6996.0000581.
 
 To cite this data or software, please use the following DOI: [![DOI](https://zenodo.org/badge/448048262.svg)](https://zenodo.org/badge/latestdoi/448048262)
 
